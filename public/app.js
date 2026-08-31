@@ -1,6 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 let containers = [];
 let pendingAction;
+let actionSubmitting = false;
 const labels = { start: '起動', stop: '停止', restart: '再起動' };
 
 async function request(url, options) {
@@ -48,10 +49,18 @@ async function showDetails(id) {
   } catch (error) { $('#detail-content').innerHTML = `<h2>詳細を取得できません</h2><p>${escape(error.message)}</p><p>${escape(error.guidance || '')}</p>`; }
 }
 function askAction(id, action) {
-  const container = containers.find(c => c.id === id); pendingAction = { id, action };
+  if (actionSubmitting) { toast('別の操作を実行中です。完了するまでお待ちください。', 'error'); return; }
+  const container = containers.find(c => c.id === id);
+  if (!container || !labels[action]) return;
+  pendingAction = { id, action };
+  actionSubmitting = false;
+  $('#confirm-run').disabled = false;
+  $('#confirm-cancel').disabled = false;
+  $('#confirm-run').textContent = '実行する';
   $('#confirm-title').textContent = `${labels[action]}を確認`;
   $('#confirm-text').textContent = `コンテナ「${container.name}」を${labels[action]}します。よろしいですか？`;
   $('#confirm').showModal();
+  $('#confirm-cancel').focus();
 }
 document.addEventListener('click', async (event) => {
   const target = event.target;
@@ -59,11 +68,23 @@ document.addEventListener('click', async (event) => {
   if (target.matches('.action')) askAction(target.dataset.id, target.dataset.action);
   if (target.matches('.close')) target.closest('dialog').close();
 });
-$('#confirm').addEventListener('close', async () => {
-  if ($('#confirm').returnValue !== 'default' || !pendingAction) return;
-  const { id, action } = pendingAction; pendingAction = undefined;
+$('#confirm-cancel').addEventListener('click', () => $('#confirm').close('cancel'));
+$('#confirm').addEventListener('close', () => {
+  pendingAction = undefined;
+});
+$('#confirm-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (actionSubmitting || !pendingAction) return;
+  const { id, action } = pendingAction;
+  actionSubmitting = true;
+  pendingAction = undefined;
+  $('#confirm-run').disabled = true;
+  $('#confirm-cancel').disabled = true;
+  $('#confirm-run').textContent = '実行中…';
+  $('#confirm').close('confirmed');
   try { const result = await request(`/api/containers/${id}/actions/${action}`, { method: 'POST' }); toast(result.message); await refresh(); }
   catch (error) { toast(`${error.message} ${error.guidance || ''}`, 'error'); await refresh(); }
+  finally { actionSubmitting = false; }
 });
 $('#state-filter').addEventListener('change', renderContainers);
 $('#refresh').addEventListener('click', refresh);

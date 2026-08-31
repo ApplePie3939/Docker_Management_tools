@@ -10,7 +10,7 @@
       <section><div class="section-title"><div><p class="eyebrow">ACTIVITY</p><h2>操作履歴</h2></div></div><div id="history" class="history">履歴を読み込み中…</div></section>
     </main>
     <dialog id="details"><button class="close" aria-label="閉じる">×</button><div id="detail-content"></div></dialog>
-    <dialog id="confirm"><h2 id="confirm-title">操作を確認</h2><p id="confirm-text"></p><p class="warning">この操作はローカル Docker Engine 上で実行されます。</p><form method="dialog"><button value="cancel" class="secondary">取り消す</button><button id="confirm-run" value="default">実行する</button></form></dialog>
+    <dialog id="confirm"><h2 id="confirm-title">操作を確認</h2><p id="confirm-text"></p><p class="warning">この操作はローカル Docker Engine 上で実行されます。</p><form id="confirm-form"><button id="confirm-cancel" type="button" class="secondary">取り消す</button><button id="confirm-run" type="submit">実行する</button></form></dialog>
     <div id="toast" role="status"></div><script src="/app.js"></script>
   </body>
 </html>

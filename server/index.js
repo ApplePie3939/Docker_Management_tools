@@ -7,6 +7,32 @@ import { appendHistory, readHistory } from './history.js';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const localHost = '127.0.0.1';
 
+export function decodeDockerLogBuffer(logBuffer) {
+  const buffer = Buffer.isBuffer(logBuffer) ? logBuffer : Buffer.from(logBuffer);
+  const chunks = [];
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    // Docker multiplexes stdout/stderr as: stream type, 3 reserved bytes,
+    // then a 4-byte big-endian payload length. TTY logs are not multiplexed.
+    if (offset + 8 > buffer.length ||
+      ![1, 2].includes(buffer[offset]) ||
+      buffer[offset + 1] !== 0 || buffer[offset + 2] !== 0 || buffer[offset + 3] !== 0) {
+      return buffer.toString('utf8');
+    }
+
+    const payloadLength = buffer.readUInt32BE(offset + 4);
+    const payloadStart = offset + 8;
+    const payloadEnd = payloadStart + payloadLength;
+    if (payloadEnd > buffer.length) return buffer.toString('utf8');
+
+    chunks.push(buffer.subarray(payloadStart, payloadEnd));
+    offset = payloadEnd;
+  }
+
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 export function createApp() {
   const app = express();
   app.use(express.json());
@@ -33,7 +59,7 @@ export function createApp() {
   app.get('/api/containers/:id/logs', async (req, res) => {
     try {
       const logs = await docker.getContainer(req.params.id).logs({ stdout: true, stderr: true, tail: 500, timestamps: true });
-      res.json({ logs: logs.toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') });
+      res.json({ logs: decodeDockerLogBuffer(logs) });
     } catch (error) { res.status(500).json({ error: toUserError(error, 'ログの取得') }); }
   });
 

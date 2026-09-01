@@ -2,6 +2,8 @@
 
 ローカル PC の Docker Engine にだけ接続し、コンテナの状態確認・起動・停止・再起動を行う Web アプリです。
 
+Composeラベルを持つ既存コンテナはプロジェクト単位でも表示され、既存コンテナに限って一括起動・停止・再起動できます。`docker compose up/down`、compose.yamlの探索、コンテナ作成・削除は行いません。
+
 ## 起動
 
 1. Docker Desktop / Docker Engine を起動します。
@@ -9,6 +11,11 @@
 3. `npm start` を実行し、[http://127.0.0.1:3000](http://127.0.0.1:3000) を開きます。
 
 Docker 接続先は既定で、Windows は `//./pipe/docker_engine`、その他は `/var/run/docker.sock` です。変更する場合は `DOCKER_SOCKET` 環境変数を指定してください。
+
+## テスト
+
+- `npm test`: APIと履歴保存の自動テスト
+- `npm run test:e2e`: Chromiumによる主要画面とDocker接続エラー表示のE2Eテスト
 
 ## 安全性
 

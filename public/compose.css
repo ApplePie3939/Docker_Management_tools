@@ -1,0 +1,5 @@
+.compose-projects { display: grid; gap: 12px; }
+.compose-project { background: white; border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; align-items: center; gap: 16px; }
+.compose-project p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+.compose-project .actions { margin-left: auto; }
+@media (max-width: 720px) { .compose-project { align-items: start; flex-direction: column; } .compose-project .actions { margin-left: 0; } }

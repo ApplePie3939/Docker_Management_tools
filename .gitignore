@@ -1,3 +1,5 @@
 node_modules/
 data/history.json
 .env
+test-results/
+playwright-report/

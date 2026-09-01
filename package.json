@@ -6,10 +6,14 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "dockerode": "^4.0.7",
     "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
   }
 }

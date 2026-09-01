@@ -1,12 +1,13 @@
 <!doctype html>
 <html lang="ja">
-  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Docker 開発環境管理</title><link rel="stylesheet" href="/styles.css" /></head>
+  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Docker 開発環境管理</title><link rel="stylesheet" href="/styles.css" /><link rel="stylesheet" href="/compose.css" /></head>
   <body>
     <header><div><p class="eyebrow">LOCAL DOCKER ENGINE</p><h1>開発環境管理</h1></div><button id="refresh" class="secondary">更新</button></header>
     <main>
       <section id="connection" class="connection loading">Docker Engine に接続を確認しています…</section>
       <section class="metrics"><article><span>起動中</span><strong id="running">—</strong><small>コンテナ</small></article><article><span>停止中</span><strong id="stopped">—</strong><small>コンテナ</small></article></section>
       <section><div class="section-title"><div><p class="eyebrow">CONTAINERS</p><h2>コンテナ一覧</h2></div><select id="state-filter"><option value="all">すべての状態</option><option value="running">起動中</option><option value="exited">停止中</option><option value="paused">一時停止</option></select></div><div class="table-wrap"><table><thead><tr><th>名前</th><th>イメージ</th><th>状態</th><th>公開ポート</th><th>操作</th></tr></thead><tbody id="containers"><tr><td colspan="5">読み込み中…</td></tr></tbody></table></div></section>
+      <section><div class="section-title"><div><p class="eyebrow">DOCKER COMPOSE</p><h2>Composeプロジェクト</h2></div></div><div id="compose-projects" class="compose-projects">読み込み中…</div></section>
       <section><div class="section-title"><div><p class="eyebrow">ACTIVITY</p><h2>操作履歴</h2></div></div><div id="history" class="history">履歴を読み込み中…</div></section>
     </main>
     <dialog id="details"><button class="close" aria-label="閉じる">×</button><div id="detail-content"></div></dialog>

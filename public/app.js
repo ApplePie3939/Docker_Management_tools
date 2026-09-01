@@ -26,11 +26,17 @@ async function refresh() {
       containers = []; renderContainers();
     }
     const history = await request('/api/history'); renderHistory(history);
-    if (dashboard.connected) { containers = await request('/api/containers'); renderContainers(); }
+    if (dashboard.connected) {
+      const [listed, projects] = await Promise.all([request('/api/containers'), request('/api/compose-projects')]);
+      containers = listed; renderContainers(); renderComposeProjects(projects);
+    }
   } catch (error) {
     $('#connection').className = 'connection error'; $('#connection').innerHTML = `<strong>● 情報を取得できません</strong><span>${escape(error.message || 'バックエンドが起動しているか確認してください。')}</span>`;
     $('#containers').innerHTML = '<tr><td colspan="5">コンテナ情報を取得できませんでした。</td></tr>';
   }
+}
+function renderComposeProjects(projects) {
+  $('#compose-projects').innerHTML = projects.length ? projects.map(project => `<article class="compose-project"><div><strong>${escape(project.name)}</strong><p>起動中 ${project.running} · 停止中 ${project.stopped}</p><p>${escape(project.containers.map(c => c.name).join(', '))}</p></div><div class="actions"><button class="small compose-action" data-project="${escape(project.name)}" data-action="start" ${project.stopped === 0 ? 'disabled' : ''}>一括起動</button><button class="small secondary compose-action" data-project="${escape(project.name)}" data-action="stop" ${project.running === 0 ? 'disabled' : ''}>一括停止</button><button class="small secondary compose-action" data-project="${escape(project.name)}" data-action="restart" ${project.running === 0 ? 'disabled' : ''}>一括再起動</button></div></article>`).join('') : '<p class="empty">検出できるComposeプロジェクトはありません。</p>';
 }
 function renderContainers() {
   const state = $('#state-filter').value;
@@ -62,10 +68,22 @@ function askAction(id, action) {
   $('#confirm').showModal();
   $('#confirm-cancel').focus();
 }
+function askComposeAction(project, action) {
+  if (actionSubmitting || !labels[action]) return;
+  pendingAction = { project, action };
+  $('#confirm-run').disabled = false;
+  $('#confirm-cancel').disabled = false;
+  $('#confirm-run').textContent = '実行する';
+  $('#confirm-title').textContent = `${labels[action]}を確認`;
+  $('#confirm-text').textContent = `Composeプロジェクト「${project}」の実行可能な既存コンテナを一括${labels[action]}します。よろしいですか？`;
+  $('#confirm').showModal();
+  $('#confirm-cancel').focus();
+}
 document.addEventListener('click', async (event) => {
   const target = event.target;
   if (target.matches('.detail')) showDetails(target.dataset.id);
   if (target.matches('.action')) askAction(target.dataset.id, target.dataset.action);
+  if (target.matches('.compose-action')) askComposeAction(target.dataset.project, target.dataset.action);
   if (target.matches('.close')) target.closest('dialog').close();
 });
 $('#confirm-cancel').addEventListener('click', () => $('#confirm').close('cancel'));
@@ -75,7 +93,7 @@ $('#confirm').addEventListener('close', () => {
 $('#confirm-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (actionSubmitting || !pendingAction) return;
-  const { id, action } = pendingAction;
+  const { id, project, action } = pendingAction;
   actionSubmitting = true;
   pendingAction = undefined;
   $('#confirm-run').disabled = true;
@@ -83,7 +101,8 @@ $('#confirm-form').addEventListener('submit', async (event) => {
   $('#confirm-run').textContent = '実行中…';
   $('#confirm').close('confirmed');
   try {
-    const result = await request(`/api/containers/${id}/actions/${action}`, { method: 'POST' });
+    const url = project ? `/api/compose-projects/${encodeURIComponent(project)}/actions/${action}` : `/api/containers/${id}/actions/${action}`;
+    const result = await request(url, { method: 'POST' });
     toast(result.historyRecorded === false ? `${result.message} ${result.historyWarning}` : result.message, result.historyRecorded === false ? 'error' : 'success');
     await refresh();
   }

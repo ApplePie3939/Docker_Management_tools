@@ -38,6 +38,21 @@ export function serializeContainer(container) {
   };
 }
 
+export function serializeComposeProjects(containers) {
+  const projects = new Map();
+  for (const container of containers) {
+    const name = container.Labels?.['com.docker.compose.project'];
+    if (!name) continue;
+    const item = serializeContainer(container);
+    const project = projects.get(name) || { name, containers: [], running: 0, stopped: 0 };
+    project.containers.push(item);
+    if (item.state === 'running') project.running += 1;
+    else project.stopped += 1;
+    projects.set(name, project);
+  }
+  return [...projects.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 export async function getContainerDetail(id) {
   const data = await docker.getContainer(id).inspect();
   return {

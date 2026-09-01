@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createApp, decodeDockerLogBuffer, startServer } from './index.js';
 import { createHistoryStore } from './history.js';
-import { serializeContainer, toUserError } from './docker.js';
+import { serializeComposeProjects, serializeContainer, toUserError } from './docker.js';
 
 function dockerFrame(stream, text) {
   const payload = Buffer.from(text, 'utf8');
@@ -167,6 +167,34 @@ test('container actions preserve Docker results when history persistence fails',
   assert.match(stopped.body.error.message, /already stopped/);
 });
 
+test('Compose projects are grouped by label and apply actions to eligible existing containers', async (t) => {
+  const history = [];
+  const calls = [];
+  const containers = [
+    { Id: 'web', Names: ['/sample-web'], Image: 'nginx', State: 'running', Status: 'Up', Ports: [], Labels: { 'com.docker.compose.project': 'sample' } },
+    { Id: 'db', Names: ['/sample-db'], Image: 'postgres', State: 'exited', Status: 'Exited', Ports: [], Labels: { 'com.docker.compose.project': 'sample' } },
+    { Id: 'other', Names: ['/other'], Image: 'busybox', State: 'running', Status: 'Up', Ports: [], Labels: {} }
+  ];
+  const dockerClient = {
+    listContainers: async () => containers,
+    getContainer: (id) => ({
+      start: async () => { calls.push(`${id}:start`); },
+      stop: async () => { calls.push(`${id}:stop`); },
+      restart: async () => { calls.push(`${id}:restart`); }
+    })
+  };
+  const baseUrl = await startTestApp(t, { dockerClient, appendHistoryFn: async entry => history.push(entry) });
+  const projects = await json(`${baseUrl}/api/compose-projects`);
+  assert.deepEqual(projects.body.map(project => [project.name, project.running, project.stopped]), [['sample', 1, 1]]);
+
+  const started = await json(`${baseUrl}/api/compose-projects/sample/actions/start`, { method: 'POST' });
+  assert.equal(started.status, 200);
+  assert.match(started.body.message, /成功 1件/);
+  assert.deepEqual(calls, ['db:start']);
+  assert.deepEqual(history.map(entry => [entry.containerId, entry.action, entry.success]), [['db', 'start', true]]);
+  assert.equal((await json(`${baseUrl}/api/compose-projects/missing/actions/start`, { method: 'POST' })).status, 404);
+});
+
 test('history store persists entries in reverse chronological order and caps them at 1000', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'docker-management-tools-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -242,4 +270,5 @@ test('container serialization and Docker error guidance are safe for missing opt
   });
   assert.match(toUserError(new Error('permission EACCES')).guidance, /Docker Desktop/);
   assert.match(toUserError(new Error('not found'), 'コンテナの停止').guidance, /コンテナの停止に失敗/);
+  assert.deepEqual(serializeComposeProjects([{ Id: 'id', Names: ['/web'], Image: 'image', State: 'running', Status: 'Up', Ports: [], Labels: { 'com.docker.compose.project': 'demo' } }]).map(project => project.name), ['demo']);
 });

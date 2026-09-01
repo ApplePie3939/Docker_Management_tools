@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { docker, getContainerDetail, serializeContainer, toUserError } from './docker.js';
+import { docker, getContainerDetail, serializeContainer, serializeComposeProjects, toUserError } from './docker.js';
 import { appendHistory, readHistory } from './history.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -56,6 +56,11 @@ export function createApp({
     catch (error) { res.status(503).json({ error: toUserError(error) }); }
   });
 
+  app.get('/api/compose-projects', async (_req, res) => {
+    try { res.json(serializeComposeProjects(await dockerClient.listContainers({ all: true }))); }
+    catch (error) { res.status(503).json({ error: toUserError(error) }); }
+  });
+
   app.get('/api/containers/:id', async (req, res) => {
     try { res.json(await getContainerDetailFn(req.params.id)); }
     catch (error) { res.status(404).json({ error: toUserError(error, 'コンテナ詳細の取得') }); }
@@ -98,6 +103,37 @@ export function createApp({
       }
       res.status(500).json({ error: formatted });
     }
+  });
+
+  app.post('/api/compose-projects/:project/actions/:action', async (req, res) => {
+    const { project, action } = req.params;
+    if (!['start', 'stop', 'restart'].includes(action)) return res.status(400).json({ error: { message: '許可されていない操作です。' } });
+    try {
+      const members = (await dockerClient.listContainers({ all: true })).filter(c => c.Labels?.['com.docker.compose.project'] === project);
+      if (!members.length) return res.status(404).json({ error: { message: 'Composeプロジェクトが見つかりません。' } });
+      const eligible = members.filter(c => action === 'start' ? ['created', 'exited'].includes(c.State) : c.State === 'running');
+      const results = await Promise.all(eligible.map(async (member) => {
+        const name = (member.Names?.[0] || member.Id).replace(/^\//, '');
+        try {
+          await dockerClient.getContainer(member.Id)[action]();
+          const message = `Composeプロジェクト「${project}」のコンテナ「${name}」を${({ start: '起動', stop: '停止', restart: '再起動' })[action]}しました。`;
+          try {
+            await appendHistoryFn({ containerId: member.Id, containerName: name, action, success: true, message });
+            return { id: member.Id, name, success: true, message, historyRecorded: true };
+          } catch (historyError) {
+            console.error('Compose操作履歴の保存に失敗しました。', historyError);
+            return { id: member.Id, name, success: true, message, historyRecorded: false };
+          }
+        } catch (error) {
+          const formatted = toUserError(error, `コンテナの${action}`);
+          await appendHistoryFn({ containerId: member.Id, containerName: name, action, success: false, message: formatted.message }).catch(() => {});
+          return { id: member.Id, name, success: false, message: formatted.message };
+        }
+      }));
+      const succeeded = results.filter(result => result.success).length;
+      const verb = ({ start: '起動', stop: '停止', restart: '再起動' })[action];
+      res.json({ message: eligible.length ? `Composeプロジェクト「${project}」へ${verb}を実行しました（成功 ${succeeded}件、失敗 ${eligible.length - succeeded}件）。` : `Composeプロジェクト「${project}」に実行可能なコンテナはありません。`, results });
+    } catch (error) { res.status(500).json({ error: toUserError(error, 'Composeプロジェクトの操作') }); }
   });
 
   app.get('/api/history', async (_req, res) => {

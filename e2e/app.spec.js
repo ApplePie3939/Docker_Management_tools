@@ -12,7 +12,9 @@ function container(id, name, state, labels = {}) {
 test.beforeAll(async () => {
   const listed = [
     container('web', 'web', 'running', { 'com.docker.compose.project': 'sample' }),
-    container('worker', 'worker', 'exited', { 'com.docker.compose.project': 'sample' })
+    container('api', 'api', 'running', { 'com.docker.compose.project': 'sample' }),
+    container('worker', 'worker', 'exited', { 'com.docker.compose.project': 'sample' }),
+    container('paused', 'paused', 'paused', { 'com.docker.compose.project': 'sample' })
   ];
   const dockerClient = {
     ping: async () => {},
@@ -20,7 +22,7 @@ test.beforeAll(async () => {
     getContainer: (id) => ({
       inspect: async () => ({ Name: `/${id}`, Config: { Image: 'example:latest', Env: ['PORT=3000'] }, State: { Status: id === 'web' ? 'running' : 'exited' }, HostConfig: { PortBindings: {} }, Mounts: [] }),
       logs: async () => Buffer.from('application started\n'),
-      start: async () => {}, stop: async () => {}, restart: async () => {}
+      start: async () => {}, stop: async () => {}, restart: async () => { if (id === 'web') throw new Error('restart failed'); }
     })
   };
   server = createApp({
@@ -48,7 +50,7 @@ test('lists, filters, opens details, and confirms a container operation', async 
   await page.getByRole('button', { name: 'worker' }).click();
   await expect(page.getByRole('heading', { name: 'worker' })).toBeVisible();
   await page.getByRole('button', { name: '閉じる' }).click();
-  await page.getByRole('button', { name: '起動', exact: true }).click();
+  await page.getByRole('button', { name: 'worker', exact: true }).locator('xpath=ancestor::tr').getByRole('button', { name: '起動', exact: true }).click();
   await expect(page.getByText('コンテナ「worker」を起動します。よろしいですか？')).toBeVisible();
   await page.getByRole('button', { name: '実行する' }).click();
   await expect(page.locator('#toast')).toContainText('コンテナ「worker」を起動しました');
@@ -59,7 +61,12 @@ test('shows compose projects and confirms a project operation', async ({ page })
   await expect(page.getByRole('heading', { name: 'Composeプロジェクト' })).toBeVisible();
   await expect(page.getByText('sample', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '一括再起動' }).click();
-  await expect(page.getByText('Composeプロジェクト「sample」の実行可能な既存コンテナを一括再起動します。よろしいですか？')).toBeVisible();
+  await expect(page.getByText('Composeプロジェクト「sample」の既存コンテナへ一括再起動を実行します。')).toBeVisible();
+  await expect(page.getByText('実行対象（2件）')).toBeVisible();
+  await expect(page.getByText(/paused：現在の状態が一時停止のため、再起動の対象外です/)).toBeVisible();
+  await page.getByRole('button', { name: '実行する' }).click();
+  await expect(page.getByRole('heading', { name: '一部失敗：sample' })).toBeVisible();
+  await expect(page.getByText(/実行対象 2件 · 成功 1件 · 失敗 1件 · 除外 2件/)).toBeVisible();
 });
 
 test('shows Docker connection guidance when the daemon is unavailable', async ({ page }) => {

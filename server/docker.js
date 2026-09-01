@@ -44,10 +44,11 @@ export function serializeComposeProjects(containers) {
     const name = container.Labels?.['com.docker.compose.project'];
     if (!name) continue;
     const item = serializeContainer(container);
-    const project = projects.get(name) || { name, containers: [], running: 0, stopped: 0 };
+    const project = projects.get(name) || { name, containers: [], running: 0, stopped: 0, other: 0 };
     project.containers.push(item);
     if (item.state === 'running') project.running += 1;
-    else project.stopped += 1;
+    else if (['created', 'exited'].includes(item.state)) project.stopped += 1;
+    else project.other += 1;
     projects.set(name, project);
   }
   return [...projects.values()].sort((a, b) => a.name.localeCompare(b.name));

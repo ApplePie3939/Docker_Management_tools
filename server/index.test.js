@@ -190,9 +190,52 @@ test('Compose projects are grouped by label and apply actions to eligible existi
   const started = await json(`${baseUrl}/api/compose-projects/sample/actions/start`, { method: 'POST' });
   assert.equal(started.status, 200);
   assert.match(started.body.message, /成功 1件/);
+  assert.equal(started.body.outcome, 'success');
+  assert.deepEqual(started.body.summary, { targeted: 1, succeeded: 1, failed: 0, excluded: 1 });
   assert.deepEqual(calls, ['db:start']);
-  assert.deepEqual(history.map(entry => [entry.containerId, entry.action, entry.success]), [['db', 'start', true]]);
+  assert.equal(history.length, 2);
+  assert.deepEqual(history.map(entry => [entry.targetType, entry.containerId, entry.action, entry.success]), [
+    ['container', 'db', 'start', true], ['compose-project', undefined, 'start', true]
+  ]);
+  assert.equal(history[0].batchId, history[1].batchId);
   assert.equal((await json(`${baseUrl}/api/compose-projects/missing/actions/start`, { method: 'POST' })).status, 404);
+});
+
+test('Compose operations exclude unsupported states and report partial failures without aborting', async (t) => {
+  const history = [];
+  const calls = [];
+  const containers = [
+    { Id: 'web', Names: ['/web'], State: 'running', Labels: { 'com.docker.compose.project': 'sample' } },
+    { Id: 'api', Names: ['/api'], State: 'running', Labels: { 'com.docker.compose.project': 'sample' } },
+    { Id: 'paused', Names: ['/paused'], State: 'paused', Labels: { 'com.docker.compose.project': 'sample' } }
+  ];
+  const dockerClient = {
+    listContainers: async () => containers,
+    getContainer: (id) => ({ restart: async () => { calls.push(id); if (id === 'api') throw new Error('restart failed'); } })
+  };
+  const baseUrl = await startTestApp(t, { dockerClient, appendHistoryFn: async entry => history.push(entry) });
+  const result = await json(`${baseUrl}/api/compose-projects/sample/actions/restart`, { method: 'POST' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.outcome, 'partial');
+  assert.deepEqual(result.body.summary, { targeted: 2, succeeded: 1, failed: 1, excluded: 1 });
+  assert.deepEqual(calls.sort(), ['api', 'web']);
+  assert.match(result.body.results.find(item => item.id === 'paused').message, /対象外/);
+  assert.equal(history.filter(entry => entry.targetType === 'container').length, 2);
+  assert.equal(history.find(entry => entry.targetType === 'compose-project').outcome, 'partial');
+});
+
+test('Compose operations report a no-op and history persistence warnings separately', async (t) => {
+  const dockerClient = {
+    listContainers: async () => [{ Id: 'paused', Names: ['/paused'], State: 'paused', Labels: { 'com.docker.compose.project': 'sample' } }],
+    getContainer: () => ({ start: async () => { throw new Error('must not run'); } })
+  };
+  const baseUrl = await startTestApp(t, { dockerClient, appendHistoryFn: async () => { throw new Error('disk full'); } });
+  const result = await json(`${baseUrl}/api/compose-projects/sample/actions/start`, { method: 'POST' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.outcome, 'no-op');
+  assert.deepEqual(result.body.summary, { targeted: 0, succeeded: 0, failed: 0, excluded: 1 });
+  assert.equal(result.body.historyRecorded, false);
+  assert.match(result.body.historyWarning, /履歴/);
 });
 
 test('history store persists entries in reverse chronological order and caps them at 1000', async (t) => {

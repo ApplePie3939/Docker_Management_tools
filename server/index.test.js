@@ -130,6 +130,7 @@ test('container actions invoke Docker and record both successful and failed hist
   const started = await json(`${baseUrl}/api/containers/abc123/actions/start`, { method: 'POST' });
   assert.equal(started.status, 200);
   assert.match(started.body.message, /コンテナ「web」を起動しました/);
+  assert.equal(started.body.historyRecorded, true);
   const restarted = await json(`${baseUrl}/api/containers/abc123/actions/restart`, { method: 'POST' });
   assert.equal(restarted.status, 200);
   assert.match(restarted.body.message, /コンテナ「web」を再起動しました/);
@@ -141,6 +142,29 @@ test('container actions invoke Docker and record both successful and failed hist
   assert.deepEqual(history.map(entry => [entry.action, entry.success, entry.containerName]), [
     ['start', true, 'web'], ['restart', true, 'web'], ['stop', false, 'web']
   ]);
+});
+
+test('container actions preserve Docker results when history persistence fails', async (t) => {
+  const dockerClient = {
+    getContainer: () => ({
+      inspect: async () => ({ Name: '/web' }),
+      start: async () => {},
+      stop: async () => { throw new Error('container is already stopped'); }
+    })
+  };
+  const baseUrl = await startTestApp(t, {
+    dockerClient,
+    appendHistoryFn: async () => { throw new Error('disk full'); }
+  });
+
+  const started = await json(`${baseUrl}/api/containers/abc123/actions/start`, { method: 'POST' });
+  assert.equal(started.status, 200);
+  assert.equal(started.body.historyRecorded, false);
+  assert.match(started.body.historyWarning, /操作履歴を保存できませんでした/);
+
+  const stopped = await json(`${baseUrl}/api/containers/abc123/actions/stop`, { method: 'POST' });
+  assert.equal(stopped.status, 500);
+  assert.match(stopped.body.error.message, /already stopped/);
 });
 
 test('history store persists entries in reverse chronological order and caps them at 1000', async (t) => {
@@ -160,6 +184,56 @@ test('history store persists entries in reverse chronological order and caps the
   await fs.writeFile(path.join(directory, 'history.json'), JSON.stringify(Array.from({ length: 1000 }, (_, index) => ({ id: String(index) }))));
   await store.appendHistory({ containerId: 'latest', action: 'restart', success: true, message: 'latest' });
   assert.equal((await store.readHistory()).length, 1000);
+});
+
+test('history store serializes concurrent appends and ignores stale temporary files', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'docker-management-tools-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const historyFile = path.join(directory, 'history.json');
+  const store = createHistoryStore(historyFile);
+  await fs.writeFile(`${historyFile}.interrupted.tmp`, '{not a history file}', 'utf8');
+
+  await Promise.all(Array.from({ length: 1005 }, (_, index) => store.appendHistory({
+    containerId: String(index), action: 'start', success: true, message: String(index)
+  })));
+
+  const history = await store.readHistory();
+  assert.equal(history.length, 1000);
+  assert.deepEqual(history.map(entry => entry.containerId), Array.from({ length: 1000 }, (_, index) => String(1004 - index)));
+  assert.deepEqual(JSON.parse(await fs.readFile(historyFile, 'utf8')), history);
+  assert.equal(await fs.readFile(`${historyFile}.interrupted.tmp`, 'utf8'), '{not a history file}');
+});
+
+test('history store quarantines malformed history and propagates quarantine and write failures', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'docker-management-tools-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const historyFile = path.join(directory, 'history.json');
+  await fs.writeFile(historyFile, '{broken', 'utf8');
+  const store = createHistoryStore(historyFile);
+
+  assert.deepEqual(await store.readHistory(), []);
+  const names = await fs.readdir(directory);
+  const corruptFile = names.find(name => /^history\.corrupt-.*\.json$/.test(name));
+  assert.ok(corruptFile);
+  assert.equal(await fs.readFile(path.join(directory, corruptFile), 'utf8'), '{broken');
+
+  await store.appendHistory({ containerId: 'fresh', action: 'start', success: true, message: 'fresh' });
+  assert.equal((await store.readHistory())[0].containerId, 'fresh');
+
+  await fs.writeFile(historyFile, '{broken again', 'utf8');
+  const failingStore = createHistoryStore(historyFile, {
+    fileSystem: { ...fs, rename: async () => { throw new Error('archive unavailable'); } }
+  });
+  await assert.rejects(failingStore.readHistory(), /archive unavailable/);
+  assert.equal(await fs.readFile(historyFile, 'utf8'), '{broken again');
+
+  await fs.writeFile(historyFile, JSON.stringify([{ id: 'preserved' }]), 'utf8');
+  await assert.rejects(failingStore.appendHistory({ containerId: 'new' }), /archive unavailable/);
+  assert.deepEqual(JSON.parse(await fs.readFile(historyFile, 'utf8')), [{ id: 'preserved' }]);
+
+  const unwritableHistoryFile = path.join(directory, 'history-directory');
+  await fs.mkdir(unwritableHistoryFile);
+  await assert.rejects(createHistoryStore(unwritableHistoryFile).appendHistory({}), /EISDIR/);
 });
 
 test('container serialization and Docker error guidance are safe for missing optional fields', () => {

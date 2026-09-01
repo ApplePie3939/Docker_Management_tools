@@ -82,7 +82,11 @@ $('#confirm-form').addEventListener('submit', async (event) => {
   $('#confirm-cancel').disabled = true;
   $('#confirm-run').textContent = '実行中…';
   $('#confirm').close('confirmed');
-  try { const result = await request(`/api/containers/${id}/actions/${action}`, { method: 'POST' }); toast(result.message); await refresh(); }
+  try {
+    const result = await request(`/api/containers/${id}/actions/${action}`, { method: 'POST' });
+    toast(result.historyRecorded === false ? `${result.message} ${result.historyWarning}` : result.message, result.historyRecorded === false ? 'error' : 'success');
+    await refresh();
+  }
   catch (error) { toast(`${error.message} ${error.guidance || ''}`, 'error'); await refresh(); }
   finally { actionSubmitting = false; }
 });

@@ -78,11 +78,24 @@ export function createApp({
       name = inspected.Name.replace(/^\//, '');
       await container[action]();
       const message = `コンテナ「${name}」を${({ start: '起動', stop: '停止', restart: '再起動' })[action]}しました。`;
-      await appendHistoryFn({ containerId: id, containerName: name, action, success: true, message });
-      res.json({ message });
+      try {
+        await appendHistoryFn({ containerId: id, containerName: name, action, success: true, message });
+        res.json({ message, historyRecorded: true });
+      } catch (historyError) {
+        console.error('操作履歴の保存に失敗しました。', historyError);
+        res.json({
+          message,
+          historyRecorded: false,
+          historyWarning: 'Docker操作は完了しましたが、操作履歴を保存できませんでした。'
+        });
+      }
     } catch (error) {
       const formatted = toUserError(error, `コンテナの${action}`);
-      await appendHistoryFn({ containerId: id, containerName: name, action, success: false, message: formatted.message });
+      try {
+        await appendHistoryFn({ containerId: id, containerName: name, action, success: false, message: formatted.message });
+      } catch (historyError) {
+        console.error('失敗した操作の履歴を保存できませんでした。', historyError);
+      }
       res.status(500).json({ error: formatted });
     }
   });

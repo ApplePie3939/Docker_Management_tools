@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { docker, getContainerDetail, serializeContainer, serializeComposeProjects, toUserError } from './docker.js';
 import { appendHistory, readHistory } from './history.js';
+import { createAuthMiddleware, createOidcAuthenticator } from './auth.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const localHost = '127.0.0.1';
@@ -60,10 +61,22 @@ export function createApp({
   dockerClient = docker,
   getContainerDetailFn = getContainerDetail,
   appendHistoryFn = appendHistory,
-  readHistoryFn = readHistory
+  readHistoryFn = readHistory,
+  authenticator
 } = {}) {
   const app = express();
+  // This application only receives forwarded requests from the local Nginx process.
+  app.set('trust proxy', 'loopback');
   app.use(express.json());
+  if (authenticator) {
+    const auth = createAuthMiddleware(authenticator);
+    app.get('/auth/login', authenticator.login);
+    app.get('/auth/callback', authenticator.callback);
+    app.get('/api/auth/me', auth.requireAuth, auth.me);
+    app.post('/api/auth/logout', auth.requireAuth, auth.logout);
+    app.use('/api', auth.requireAuth, auth.csrf);
+    app.use(auth.requireAuth);
+  }
   app.use(express.static(path.join(root, 'public')));
 
   app.get('/api/dashboard', async (_req, res) => {
@@ -188,7 +201,8 @@ export function createApp({
 }
 
 export function startServer(port = process.env.PORT || 3000) {
-  const server = createApp().listen(port, localHost, () => {
+  const authenticator = createOidcAuthenticator();
+  const server = createApp({ authenticator }).listen(port, localHost, () => {
     console.log(`Docker Management Tools: http://${localHost}:${server.address().port}`);
   });
   return server;

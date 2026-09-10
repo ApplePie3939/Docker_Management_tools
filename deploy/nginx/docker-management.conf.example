@@ -1,0 +1,35 @@
+# Copy this file into the Nginx configuration and replace the example values.
+# This is the only network-facing component. Do not publish port 3000 or Docker's API.
+server {
+    listen 443 ssl http2;
+    server_name docker-management.internal.example;
+
+    ssl_certificate     /etc/ssl/certs/docker-management.pem;
+    ssl_certificate_key /etc/ssl/private/docker-management.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Replace with the organization-approved internal network ranges.
+    allow 10.0.0.0/8;
+    allow 172.16.0.0/12;
+    allow 192.168.0.0/16;
+    deny all;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+server {
+    listen 80;
+    server_name docker-management.internal.example;
+    allow 10.0.0.0/8;
+    allow 172.16.0.0/12;
+    allow 192.168.0.0/16;
+    deny all;
+    return 301 https://$host$request_uri;
+}

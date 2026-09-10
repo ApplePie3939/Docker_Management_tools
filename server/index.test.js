@@ -52,7 +52,7 @@ test('an empty Docker log buffer returns an empty string', () => {
 });
 
 test('HTTP server listens only on the IPv4 loopback address', async (t) => {
-  const server = startServer(0);
+  const server = createApp().listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => server.close());
 
@@ -61,6 +61,10 @@ test('HTTP server listens only on the IPv4 loopback address', async (t) => {
 
   const response = await fetch(`http://127.0.0.1:${address.port}/`);
   assert.equal(response.status, 200);
+});
+
+test('production server refuses to start without required OIDC settings', () => {
+  assert.throws(() => startServer(0), /OIDC_ISSUER must be configured/);
 });
 
 test('Docker API routes return dashboard, container list, details, and decoded logs', async (t) => {

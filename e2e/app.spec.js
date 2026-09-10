@@ -1,15 +1,24 @@
 import { test, expect } from '@playwright/test';
 import { once } from 'node:events';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { createApp } from '../server/index.js';
+import { createSessionStore } from '../server/auth.js';
 
 let server;
 let baseUrl;
+let store, directory, sessionValue;
 
 function container(id, name, state, labels = {}) {
   return { Id: id, Names: [`/${name}`], Image: 'example:latest', State: state, Status: state === 'running' ? 'Up 1 minute' : 'Exited (0)', Ports: [], Labels: labels };
 }
 
 test.beforeAll(async () => {
+  directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dmt-e2e-'));
+  store = createSessionStore(path.join(directory, 'auth.sqlite'), { legacyHistoryFile: path.join(directory, 'history.json') });
+  store.setUser({ subject: 'e2e-operator', role: 'operator' });
+  sessionValue = store.createSession({ subject: 'e2e-operator', name: 'E2E Operator' }).value;
   const listed = [
     container('web', 'web', 'running', { 'com.docker.compose.project': 'sample' }),
     container('api', 'api', 'running', { 'com.docker.compose.project': 'sample' }),
@@ -26,6 +35,7 @@ test.beforeAll(async () => {
     })
   };
   server = createApp({
+    authenticator: { store, login: (_req, res) => res.status(501).end(), callback: (_req, res) => res.status(501).end() },
     dockerClient,
     getContainerDetailFn: async (id) => ({ id, name: id, image: 'example:latest', state: id === 'web' ? 'running' : 'exited', environment: ['PORT=3000'], ports: [], mounts: [] }),
     readHistoryFn: async () => [],
@@ -38,6 +48,12 @@ test.beforeAll(async () => {
 test.afterAll(() => {
   server.closeAllConnections();
   server.close();
+  store.close();
+  return fs.rm(directory, { recursive: true, force: true });
+});
+
+test.beforeEach(async ({ context }) => {
+  await context.addCookies([{ name: 'dmt_session', value: sessionValue, domain: '127.0.0.1', path: '/', secure: false, httpOnly: true }]);
 });
 
 test('lists, filters, opens details, and confirms a container operation', async ({ page }) => {

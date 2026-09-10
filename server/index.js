@@ -65,6 +65,10 @@ export function createApp({
   authenticator
 } = {}) {
   const app = express();
+  const auditStore = authenticator?.store;
+  const recordAudit = async (req, entry) => auditStore
+    ? auditStore.recordAudit({ actorSubject: req.auth?.subject, actorName: req.auth?.name, ...entry })
+    : appendHistoryFn(entry);
   // This application only receives forwarded requests from the local Nginx process.
   app.set('trust proxy', 'loopback');
   app.use(express.json());
@@ -76,6 +80,27 @@ export function createApp({
     app.post('/api/auth/logout', auth.requireAuth, auth.logout);
     app.use('/api', auth.requireAuth, auth.csrf);
     app.use(auth.requireAuth);
+
+    app.get('/api/admin/users', auth.requireRole('admin'), (_req, res) => res.json(auditStore.listUsers()));
+    app.put('/api/admin/users/:subject', auth.requireRole('admin'), (req, res) => {
+      try {
+        const user = auditStore.setUser({ subject: req.params.subject, ...req.body });
+        recordAudit(req, { target: req.params.subject, action: 'user-role-updated', outcome: 'success', message: `利用者「${req.params.subject}」のロールを${user.role}に設定しました。` });
+        res.json(user);
+      } catch (error) { res.status(400).json({ error: { message: error.message } }); }
+    });
+    app.delete('/api/admin/users/:subject', auth.requireRole('admin'), (req, res) => {
+      if (req.params.subject === req.auth.subject) return res.status(400).json({ error: { message: '自分自身のロールは削除できません。' } });
+      if (!auditStore.deleteUser(req.params.subject)) return res.status(404).json({ error: { message: '利用者が見つかりません。' } });
+      recordAudit(req, { target: req.params.subject, action: 'user-removed', outcome: 'success', message: `利用者「${req.params.subject}」を削除しました。` });
+      res.status(204).end();
+    });
+    app.get('/api/admin/host', auth.requireRole('admin'), (_req, res) => res.json(auditStore.host()));
+    app.put('/api/admin/host', auth.requireRole('admin'), (req, res) => {
+      try { const host = auditStore.setHostName(req.body.displayName); recordAudit(req, { target: host.id, action: 'host-name-updated', outcome: 'success', message: `ホスト表示名を「${host.displayName}」に変更しました。` }); res.json(host); }
+      catch (error) { res.status(400).json({ error: { message: error.message } }); }
+    });
+    app.get('/api/admin/audit', auth.requireRole('admin'), (req, res) => res.json(auditStore.queryAudit(req.query)));
   }
   app.use(express.static(path.join(root, 'public')));
 
@@ -109,7 +134,7 @@ export function createApp({
     } catch (error) { res.status(500).json({ error: toUserError(error, 'ログの取得') }); }
   });
 
-  app.post('/api/containers/:id/actions/:action', async (req, res) => {
+  app.post('/api/containers/:id/actions/:action', authenticator ? createAuthMiddleware(authenticator).requireRole('operator') : (_req, _res, next) => next(), async (req, res) => {
     const { id, action } = req.params;
     if (!['start', 'stop', 'restart'].includes(action)) return res.status(400).json({ error: { message: '許可されていない操作です。' } });
     let name = id;
@@ -120,7 +145,7 @@ export function createApp({
       await container[action]();
       const message = `コンテナ「${name}」を${({ start: '起動', stop: '停止', restart: '再起動' })[action]}しました。`;
       try {
-        await appendHistoryFn({ containerId: id, containerName: name, action, success: true, message });
+        await recordAudit(req, { target: name, action, outcome: 'success', message, containerId: id, containerName: name, success: true });
         res.json({ message, historyRecorded: true });
       } catch (historyError) {
         console.error('操作履歴の保存に失敗しました。', historyError);
@@ -133,7 +158,7 @@ export function createApp({
     } catch (error) {
       const formatted = toUserError(error, `コンテナの${action}`);
       try {
-        await appendHistoryFn({ containerId: id, containerName: name, action, success: false, message: formatted.message });
+        await recordAudit(req, { target: name, action, outcome: 'failed', message: formatted.message, containerId: id, containerName: name, success: false });
       } catch (historyError) {
         console.error('失敗した操作の履歴を保存できませんでした。', historyError);
       }
@@ -141,7 +166,7 @@ export function createApp({
     }
   });
 
-  app.post('/api/compose-projects/:project/actions/:action', async (req, res) => {
+  app.post('/api/compose-projects/:project/actions/:action', authenticator ? createAuthMiddleware(authenticator).requireRole('operator') : (_req, _res, next) => next(), async (req, res) => {
     const { project, action } = req.params;
     if (!['start', 'stop', 'restart'].includes(action)) return res.status(400).json({ error: { message: '許可されていない操作です。' } });
     try {
@@ -159,7 +184,7 @@ export function createApp({
           await dockerClient.getContainer(id)[action]();
           const message = `Composeプロジェクト「${project}」のコンテナ「${name}」を${({ start: '起動', stop: '停止', restart: '再起動' })[action]}しました。`;
           try {
-            await appendHistoryFn({ targetType: 'container', containerId: id, containerName: name, projectName: project, batchId, action, success: true, outcome: 'success', message });
+            await recordAudit(req, { target: `Compose:${project}/${name}`, action, outcome: 'success', message, targetType: 'container', containerId: id, containerName: name, projectName: project, batchId, success: true });
             return { id, name, state, outcome: 'success', success: true, message, historyRecorded: true };
           } catch (historyError) {
             console.error('Compose操作履歴の保存に失敗しました。', historyError);
@@ -167,7 +192,7 @@ export function createApp({
           }
         } catch (error) {
           const formatted = toUserError(error, `コンテナの${action}`);
-          const historyRecorded = await appendHistoryFn({ targetType: 'container', containerId: id, containerName: name, projectName: project, batchId, action, success: false, outcome: 'failed', message: formatted.message })
+          const historyRecorded = await recordAudit(req, { target: `Compose:${project}/${name}`, action, outcome: 'failed', message: formatted.message, targetType: 'container', containerId: id, containerName: name, projectName: project, batchId, success: false })
             .then(() => true).catch(() => false);
           return { id, name, state, outcome: 'failed', success: false, message: formatted.message, historyRecorded };
         }
@@ -182,7 +207,7 @@ export function createApp({
         : `Composeプロジェクト「${project}」へ${verb}を実行しました（成功 ${succeeded}件、失敗 ${failed}件、除外 ${excluded.length}件）。`;
       let projectHistoryRecorded = true;
       try {
-        await appendHistoryFn({ targetType: 'compose-project', projectName: project, containerName: project, batchId, action, success: outcome === 'success', outcome, summary, message });
+        await recordAudit(req, { target: `Compose:${project}`, action, outcome, message, targetType: 'compose-project', projectName: project, containerName: project, batchId, success: outcome === 'success' });
       } catch (historyError) {
         console.error('Composeプロジェクト要約履歴の保存に失敗しました。', historyError);
         projectHistoryRecorded = false;
@@ -193,7 +218,7 @@ export function createApp({
   });
 
   app.get('/api/history', async (_req, res) => {
-    try { res.json(await readHistoryFn()); }
+    try { res.json(auditStore ? auditStore.queryAudit({ pageSize: 25 }) : { items: await readHistoryFn(), total: 0, page: 1, pageSize: 25 }); }
     catch (error) { res.status(500).json({ error: toUserError(error, '操作履歴の読み込み') }); }
   });
 

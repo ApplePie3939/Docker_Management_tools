@@ -9,7 +9,8 @@ import { createApp } from './index.js';
 
 async function startAuthenticatedApp(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dmt-auth-'));
-  const store = createSessionStore(path.join(directory, 'auth.sqlite'));
+  const store = createSessionStore(path.join(directory, 'auth.sqlite'), { legacyHistoryFile: path.join(directory, 'history.json') });
+  store.setUser({ subject: 'user-1', role: 'viewer' });
   const server = createApp({
     authenticator: { store, login: (_req, res) => res.status(501).end(), callback: (_req, res) => res.status(501).end() },
     dockerClient: { ping: async () => {}, listContainers: async () => [] }, readHistoryFn: async () => []
@@ -31,7 +32,8 @@ test('authentication protects pages and APIs, and logout invalidates the server 
   const { value, session } = store.createSession({ subject: 'user-1', name: '開発者', email: 'dev@example.test' });
   const cookie = `dmt_session=${value}`;
   const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } });
-  assert.deepEqual(await me.json(), { subject: 'user-1', name: '開発者', email: 'dev@example.test', csrfToken: session.csrfToken, expiresAt: session.expiresAt });
+  const identity = await me.json();
+  assert.equal(identity.subject, 'user-1'); assert.equal(identity.role, 'viewer'); assert.equal(identity.host.id, 'shared-docker-host'); assert.equal(identity.csrfToken, session.csrfToken);
 
   const missingCsrf = await fetch(`${baseUrl}/api/auth/logout`, { method: 'POST', headers: { cookie, Origin: baseUrl } });
   assert.equal(missingCsrf.status, 403);
@@ -49,9 +51,41 @@ test('state-changing Docker APIs require same-origin CSRF validation', async (t)
   assert.equal((await fetch(`${baseUrl}/api/containers/x/actions/start`, { method: 'POST', headers: { ...headers, Origin: 'https://attacker.example', 'X-CSRF-Token': session.csrfToken } })).status, 403);
 });
 
+test('roles limit Docker operations and administrators manage users and audit records', async (t) => {
+  const { baseUrl, store } = await startAuthenticatedApp(t);
+  const viewer = store.createSession({ subject: 'user-1' });
+  const viewerHeaders = { cookie: `dmt_session=${viewer.value}`, Origin: baseUrl, 'X-CSRF-Token': viewer.session.csrfToken };
+  assert.equal((await fetch(`${baseUrl}/api/containers/x/actions/start`, { method: 'POST', headers: viewerHeaders })).status, 403);
+  store.setUser({ subject: 'admin-1', role: 'admin' });
+  const admin = store.createSession({ subject: 'admin-1' });
+  const headers = { cookie: `dmt_session=${admin.value}`, Origin: baseUrl, 'X-CSRF-Token': admin.session.csrfToken, 'Content-Type': 'application/json' };
+  const saved = await fetch(`${baseUrl}/api/admin/users/operator-1`, { method: 'PUT', headers, body: JSON.stringify({ role: 'operator', name: '操作者' }) });
+  assert.equal(saved.status, 200);
+  assert.equal((await fetch(`${baseUrl}/api/admin/users`, { headers })).status, 200);
+  const host = await fetch(`${baseUrl}/api/admin/host`, { method: 'PUT', headers, body: JSON.stringify({ displayName: '共有ホストA' }) });
+  assert.equal(host.status, 200);
+  const audit = await (await fetch(`${baseUrl}/api/admin/audit`, { headers })).json();
+  assert.equal(audit.total, 2);
+});
+
+test('legacy history migrates once into the SQLite audit ledger', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dmt-migration-'));
+  const databaseFile = path.join(directory, 'auth.sqlite'), historyFile = path.join(directory, 'history.json');
+  await fs.writeFile(historyFile, JSON.stringify([{ at: '2026-01-01T00:00:00.000Z', containerName: 'web', action: 'start', success: true, message: 'started' }]));
+  const store = createSessionStore(databaseFile, { legacyHistoryFile: historyFile });
+  assert.equal(store.queryAudit().total, 1);
+  store.close();
+  await fs.writeFile(historyFile, JSON.stringify([{ containerName: 'must-not-import' }]));
+  const reopened = createSessionStore(databaseFile, { legacyHistoryFile: historyFile });
+  assert.equal(reopened.queryAudit().total, 1);
+  reopened.close();
+  await fs.rm(directory, { recursive: true, force: true });
+});
+
 test('OIDC callback validates PKCE, state and nonce before creating an allowed session', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dmt-oidc-'));
-  const store = createSessionStore(path.join(directory, 'auth.sqlite'));
+  const store = createSessionStore(path.join(directory, 'auth.sqlite'), { legacyHistoryFile: path.join(directory, 'history.json') });
+  store.setUser({ subject: 'oidc-user', role: 'admin' });
   let expected, callbackBase;
   const client = {
     randomPKCECodeVerifier: () => 'verifier', calculatePKCECodeChallenge: async value => `challenge-${value}`,

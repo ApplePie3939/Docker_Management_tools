@@ -19,11 +19,12 @@ OIDC_CLIENT_ID=docker-management
 OIDC_CLIENT_SECRET=replace-with-a-secret
 OIDC_REDIRECT_URI=https://docker-management.internal.example/auth/callback
 OIDC_ALLOWED_GROUP=docker-management-users
+OIDC_ADMIN_SUB=replace-with-initial-admin-subject
 # IdP がグループを返すクレーム名。未指定時は groups。
 OIDC_GROUPS_CLAIM=groups
 ```
 
-`OIDC_ISSUER`、`OIDC_CLIENT_ID`、`OIDC_CLIENT_SECRET`、`OIDC_REDIRECT_URI`、`OIDC_ALLOWED_GROUP` は必須です。IdP は `sub` と許可グループを ID Token または UserInfo で返す必要があります。ログインセッションは `data/auth.sqlite` に保存され、8 時間で失効します。
+`OIDC_ISSUER`、`OIDC_CLIENT_ID`、`OIDC_CLIENT_SECRET`、`OIDC_REDIRECT_URI`、`OIDC_ALLOWED_GROUP`、`OIDC_ADMIN_SUB` は必須です。`OIDC_ADMIN_SUB` には最初の管理者の不変 `sub` を設定します。IdP は `sub` と許可グループを ID Token または UserInfo で返す必要があります。ログインセッション、ロール、監査履歴は `data/auth.sqlite` に保存され、セッションは8時間で失効します。
 
 Docker 接続先は既定で、Windows は `//./pipe/docker_engine`、その他は `/var/run/docker.sock` です。変更する場合は `DOCKER_SOCKET` 環境変数を指定してください。
 
@@ -38,4 +39,4 @@ Docker 接続先は既定で、Windows は `//./pipe/docker_engine`、その他�
 - Web サーバーは `127.0.0.1` でのみ待ち受けます。外部公開は Nginx の TLS と社内 CIDR 制限を通す構成だけをサポートします。
 - Docker Engine API および Docker ソケットを外部に公開してはいけません。Node プロセスは専用サービスアカウントで実行し、Docker へのアクセス権だけを必要最小限に付与してください。
 - 操作対象は共有する開発用 Docker Engine 1 台です。削除・作成・イメージ変更、本番 Docker ホストの管理は実装していません。
-- 履歴は `data/history.json`、認証セッションは `data/auth.sqlite` にローカル保存されます（Git 管理対象外）。
+- 認証、ロール、操作・管理変更の監査履歴は `data/auth.sqlite` にローカル保存されます（Git 管理対象外）。既存の `data/history.json` は初回起動時に一度だけ移行されます。

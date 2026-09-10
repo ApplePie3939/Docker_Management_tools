@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -7,145 +7,55 @@ import * as oidc from 'openid-client';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const eightHours = 8 * 60 * 60 * 1000;
+const roles = ['viewer', 'operator', 'admin'];
+const rank = { viewer: 1, operator: 2, admin: 3 };
+const hostId = 'shared-docker-host';
+const required = (name, value = process.env[name]) => { if (!value) throw new Error(`${name} must be configured before the server starts.`); return value; };
+const token = () => randomBytes(32).toString('base64url');
+const hash = value => createHash('sha256').update(value).digest('hex');
+const parseCookies = (header = '') => Object.fromEntries(header.split(';').map(item => item.trim().split(/=(.*)/s)).filter(([key]) => key).map(([key, value = '']) => [key, decodeURIComponent(value)]));
 
-function required(name, value = process.env[name]) {
-  if (!value) throw new Error(`${name} must be configured before the server starts.`);
-  return value;
-}
-
-function token() { return randomBytes(32).toString('base64url'); }
-function hash(value) { return createHash('sha256').update(value).digest('hex'); }
-function parseCookies(header = '') {
-  return Object.fromEntries(header.split(';').map(item => item.trim().split(/=(.*)/s)).filter(([key]) => key).map(([key, value = '']) => [key, decodeURIComponent(value)]));
-}
-
-export function createSessionStore(databaseFile = path.join(root, 'data', 'auth.sqlite')) {
+export function createSessionStore(databaseFile = path.join(root, 'data', 'auth.sqlite'), { adminSubject, legacyHistoryFile = path.join(root, 'data', 'history.json') } = {}) {
   mkdirSync(path.dirname(databaseFile), { recursive: true });
   const database = new DatabaseSync(databaseFile);
-  database.exec(`
-    PRAGMA journal_mode = WAL;
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, name TEXT, email TEXT,
-      csrf_token TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
-    ) STRICT;
-    CREATE TABLE IF NOT EXISTS login_flows (
-      state TEXT PRIMARY KEY, nonce TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at INTEGER NOT NULL
-    ) STRICT;
-  `);
-  const cleanup = () => {
-    const now = Date.now();
-    database.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
-    database.prepare('DELETE FROM login_flows WHERE expires_at <= ?').run(now);
-  };
+  database.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, name TEXT, email TEXT, csrf_token TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS login_flows (state TEXT PRIMARY KEY, nonce TEXT NOT NULL, code_verifier TEXT NOT NULL, expires_at INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS users (subject TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', role TEXT NOT NULL CHECK(role IN ('viewer','operator','admin')), updated_at INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, updated_at INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS audit_entries (id INTEGER PRIMARY KEY, at TEXT NOT NULL, actor_subject TEXT, actor_name TEXT, host_id TEXT NOT NULL, host_name TEXT NOT NULL, target TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL, message TEXT NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL) STRICT;`);
+  database.prepare('INSERT OR IGNORE INTO hosts (id, display_name, updated_at) VALUES (?, ?, ?)').run(hostId, '共有開発 Docker ホスト', Date.now());
+  if (adminSubject) database.prepare("INSERT INTO users (subject, role, updated_at) VALUES (?, 'admin', ?) ON CONFLICT(subject) DO UPDATE SET role='admin', updated_at=excluded.updated_at").run(adminSubject, Date.now());
+  const host = () => database.prepare('SELECT id, display_name AS displayName FROM hosts WHERE id=?').get(hostId);
+  const user = subject => database.prepare('SELECT subject,name,email,role FROM users WHERE subject=?').get(subject);
+  const audit = entry => { const currentHost = host(); database.prepare('INSERT INTO audit_entries (at,actor_subject,actor_name,host_id,host_name,target,action,outcome,message) VALUES (?,?,?,?,?,?,?,?,?)').run(new Date().toISOString(), entry.actorSubject || null, entry.actorName || null, currentHost.id, currentHost.displayName, entry.target, entry.action, entry.outcome, entry.message); };
+  const cleanup = () => { const now = Date.now(); database.prepare('DELETE FROM sessions WHERE expires_at<=?').run(now); database.prepare('DELETE FROM login_flows WHERE expires_at<=?').run(now); };
+
+  if (!database.prepare('SELECT 1 FROM migrations WHERE name=?').get('history-json-to-sqlite-v1')) {
+    let old = [];
+    try { old = JSON.parse(readFileSync(legacyHistoryFile, 'utf8')); if (!Array.isArray(old)) throw new Error('history.json must be an array'); }
+    catch (error) { if (error.code !== 'ENOENT') throw new Error(`操作履歴の移行に失敗しました: ${error.message}`); }
+    database.exec('BEGIN');
+    try { for (const entry of old) database.prepare('INSERT INTO audit_entries (at,actor_subject,actor_name,host_id,host_name,target,action,outcome,message) VALUES (?,NULL,NULL,?,?,?,?,?,?)').run(entry.at || new Date().toISOString(), hostId, host().displayName, entry.projectName || entry.containerName || entry.containerId || '不明', entry.action || 'legacy', entry.outcome || (entry.success ? 'success' : 'failed'), entry.message || '旧形式から移行した履歴'); database.prepare('INSERT INTO migrations (name,completed_at) VALUES (?,?)').run('history-json-to-sqlite-v1', Date.now()); database.exec('COMMIT'); } catch (error) { database.exec('ROLLBACK'); throw error; }
+  }
   return {
-    createFlow() {
-      cleanup();
-      const flow = { state: token(), nonce: token(), codeVerifier: oidc.randomPKCECodeVerifier() };
-      database.prepare('INSERT INTO login_flows (state, nonce, code_verifier, expires_at) VALUES (?, ?, ?, ?)').run(flow.state, flow.nonce, flow.codeVerifier, Date.now() + 10 * 60 * 1000);
-      return flow;
-    },
-    takeFlow(state) {
-      cleanup();
-      const flow = database.prepare('SELECT nonce, code_verifier AS codeVerifier FROM login_flows WHERE state = ?').get(state);
-      database.prepare('DELETE FROM login_flows WHERE state = ?').run(state);
-      return flow;
-    },
-    createSession(identity) {
-      cleanup();
-      const value = token();
-      const session = { ...identity, csrfToken: token(), createdAt: Date.now(), expiresAt: Date.now() + eightHours };
-      database.prepare('INSERT INTO sessions (token_hash, subject, name, email, csrf_token, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(hash(value), session.subject, session.name || null, session.email || null, session.csrfToken, session.createdAt, session.expiresAt);
-      return { value, session };
-    },
-    getSession(value) {
-      if (!value) return undefined;
-      cleanup();
-      return database.prepare('SELECT subject, name, email, csrf_token AS csrfToken, created_at AS createdAt, expires_at AS expiresAt FROM sessions WHERE token_hash = ?').get(hash(value));
-    },
-    destroySession(value) { if (value) database.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hash(value)); },
+    createFlow() { cleanup(); const flow = { state: token(), nonce: token(), codeVerifier: oidc.randomPKCECodeVerifier() }; database.prepare('INSERT INTO login_flows (state,nonce,code_verifier,expires_at) VALUES (?,?,?,?)').run(flow.state, flow.nonce, flow.codeVerifier, Date.now() + 600000); return flow; },
+    takeFlow(state) { cleanup(); const flow = database.prepare('SELECT nonce,code_verifier AS codeVerifier FROM login_flows WHERE state=?').get(state); database.prepare('DELETE FROM login_flows WHERE state=?').run(state); return flow; },
+    createSession(identity) { cleanup(); const assigned = user(identity.subject); if (!assigned) { const error = new Error('このアカウントには利用ロールが割り当てられていません。'); error.code = 'FORBIDDEN'; throw error; } const value = token(), session = { ...identity, name: identity.name || assigned.name, email: identity.email || assigned.email, role: assigned.role, host: host(), csrfToken: token(), createdAt: Date.now(), expiresAt: Date.now() + eightHours }; database.prepare('INSERT INTO sessions (token_hash,subject,name,email,csrf_token,created_at,expires_at) VALUES (?,?,?,?,?,?,?)').run(hash(value), session.subject, session.name || null, session.email || null, session.csrfToken, session.createdAt, session.expiresAt); return { value, session }; },
+    getSession(value) { if (!value) return undefined; cleanup(); const session = database.prepare('SELECT subject,name,email,csrf_token AS csrfToken,created_at AS createdAt,expires_at AS expiresAt FROM sessions WHERE token_hash=?').get(hash(value)); const assigned = session && user(session.subject); return assigned && { ...session, role: assigned.role, host: host() }; },
+    destroySession(value) { if (value) database.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash(value)); },
+    listUsers() { return database.prepare('SELECT subject,name,email,role FROM users ORDER BY subject').all(); },
+    setUser({ subject, name = '', email = '', role }) { if (!subject || !roles.includes(role)) throw new Error('利用者IDまたはロールが不正です。'); database.prepare('INSERT INTO users (subject,name,email,role,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(subject) DO UPDATE SET name=excluded.name,email=excluded.email,role=excluded.role,updated_at=excluded.updated_at').run(subject, name, email, role, Date.now()); return user(subject); },
+    deleteUser(subject) { return database.prepare('DELETE FROM users WHERE subject=?').run(subject).changes > 0; }, host,
+    setHostName(displayName) { if (!displayName?.trim()) throw new Error('ホスト表示名を入力してください。'); database.prepare('UPDATE hosts SET display_name=?,updated_at=? WHERE id=?').run(displayName.trim(), Date.now(), hostId); return host(); },
+    recordAudit: audit,
+    queryAudit({ subject, target, outcome, from, to, page = 1, pageSize = 25 } = {}) { const where = [], values = []; if (subject) { where.push('actor_subject=?'); values.push(subject); } if (target) { where.push('target LIKE ?'); values.push(`%${target}%`); } if (outcome) { where.push('outcome=?'); values.push(outcome); } if (from) { where.push('at>=?'); values.push(new Date(from).toISOString()); } if (to) { where.push('at<=?'); values.push(new Date(to).toISOString()); } const clause = where.length ? `WHERE ${where.join(' AND ')}` : '', safePage = Math.max(1, Number(page) || 1), safeSize = Math.min(100, Math.max(1, Number(pageSize) || 25)); const total = database.prepare(`SELECT COUNT(*) AS count FROM audit_entries ${clause}`).get(...values).count; const items = database.prepare(`SELECT id,at,actor_subject AS actorSubject,actor_name AS actorName,host_id AS hostId,host_name AS hostName,target,action,outcome,message FROM audit_entries ${clause} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...values, safeSize, (safePage - 1) * safeSize); return { items, total, page: safePage, pageSize: safeSize }; },
     close() { database.close(); }
   };
 }
 
-export function oidcSettingsFromEnv(env = process.env) {
-  return {
-    issuer: required('OIDC_ISSUER', env.OIDC_ISSUER), clientId: required('OIDC_CLIENT_ID', env.OIDC_CLIENT_ID),
-    clientSecret: required('OIDC_CLIENT_SECRET', env.OIDC_CLIENT_SECRET), redirectUri: required('OIDC_REDIRECT_URI', env.OIDC_REDIRECT_URI),
-    allowedGroup: required('OIDC_ALLOWED_GROUP', env.OIDC_ALLOWED_GROUP), groupsClaim: env.OIDC_GROUPS_CLAIM || 'groups'
-  };
-}
-
-function identityFromClaims(claims, settings) {
-  if (!claims?.sub) throw new Error('IdP did not return a subject claim.');
-  const groups = claims[settings.groupsClaim];
-  const groupList = Array.isArray(groups) ? groups : typeof groups === 'string' ? [groups] : [];
-  if (!groupList.includes(settings.allowedGroup)) {
-    const error = new Error('このアカウントには利用権限がありません。'); error.code = 'FORBIDDEN'; throw error;
-  }
-  return { subject: claims.sub, name: claims.name || claims.preferred_username || '', email: claims.email || '' };
-}
-
-export function createOidcAuthenticator({ settings = oidcSettingsFromEnv(), store = createSessionStore(), client = oidc } = {}) {
-  let configuration;
-  async function config() {
-    configuration ||= client.discovery(new URL(settings.issuer), settings.clientId, { client_secret: settings.clientSecret, redirect_uris: [settings.redirectUri], response_types: ['code'] });
-    return configuration;
-  }
-  return {
-    store,
-    async login(req, res, next) {
-      try {
-        const flow = store.createFlow();
-        const codeChallenge = await client.calculatePKCECodeChallenge(flow.codeVerifier);
-        const destination = client.buildAuthorizationUrl(await config(), { redirect_uri: settings.redirectUri, scope: 'openid profile email', response_type: 'code', state: flow.state, nonce: flow.nonce, code_challenge: codeChallenge, code_challenge_method: 'S256' });
-        res.redirect(destination.href);
-      } catch (error) { next(error); }
-    },
-    async callback(req, res, next) {
-      try {
-        const flow = store.takeFlow(req.query.state);
-        if (!flow) return res.status(400).send('ログイン要求が無効または期限切れです。もう一度ログインしてください。');
-        const callbackUrl = new URL(`${req.protocol}://${req.get('host')}${req.originalUrl}`);
-        const tokens = await client.authorizationCodeGrant(await config(), callbackUrl, { pkceCodeVerifier: flow.codeVerifier, expectedState: req.query.state, expectedNonce: flow.nonce });
-        let claims = tokens.claims();
-        if ((!claims?.[settings.groupsClaim]) && tokens.access_token) {
-          const userInfo = await client.fetchUserInfo(await config(), tokens.access_token, claims?.sub);
-          claims = { ...claims, ...userInfo };
-        }
-        const { value } = store.createSession(identityFromClaims(claims, settings));
-        res.cookie('dmt_session', value, { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: eightHours });
-        res.redirect('/');
-      } catch (error) {
-        if (error.code === 'FORBIDDEN') return res.status(403).send(error.message);
-        next(error);
-      }
-    }
-  };
-}
-
-export function createAuthMiddleware(authenticator) {
-  const store = authenticator.store;
-  const sessionFor = req => store.getSession(parseCookies(req.headers.cookie).dmt_session);
-  const apiUnauthorized = res => res.status(401).json({ error: { message: '認証が必要です。', guidance: 'ログインしてからもう一度実行してください。' } });
-  return {
-    requireAuth(req, res, next) {
-      const session = sessionFor(req);
-      if (!session) return req.originalUrl.startsWith('/api/') ? apiUnauthorized(res) : res.redirect('/auth/login');
-      req.auth = session;
-      next();
-    },
-    me(req, res) { const { subject, name, email, csrfToken, expiresAt } = req.auth; res.json({ subject, name, email, csrfToken, expiresAt }); },
-    logout(req, res) {
-      const session = req.auth;
-      if (req.get('origin') !== `${req.protocol}://${req.get('host')}` || req.get('x-csrf-token') !== session.csrfToken) return res.status(403).json({ error: { message: '無効なログアウト要求です。' } });
-      store.destroySession(parseCookies(req.headers.cookie).dmt_session);
-      res.clearCookie('dmt_session', { httpOnly: true, secure: true, sameSite: 'lax', path: '/' });
-      res.status(204).end();
-    },
-    csrf(req, res, next) {
-      if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
-      if (req.get('origin') !== `${req.protocol}://${req.get('host')}` || req.get('x-csrf-token') !== req.auth.csrfToken) return res.status(403).json({ error: { message: '無効な操作要求です。画面を更新してもう一度実行してください。' } });
-      next();
-    }
-  };
-}
+export function oidcSettingsFromEnv(env = process.env) { return { issuer: required('OIDC_ISSUER', env.OIDC_ISSUER), clientId: required('OIDC_CLIENT_ID', env.OIDC_CLIENT_ID), clientSecret: required('OIDC_CLIENT_SECRET', env.OIDC_CLIENT_SECRET), redirectUri: required('OIDC_REDIRECT_URI', env.OIDC_REDIRECT_URI), allowedGroup: required('OIDC_ALLOWED_GROUP', env.OIDC_ALLOWED_GROUP), adminSubject: required('OIDC_ADMIN_SUB', env.OIDC_ADMIN_SUB), groupsClaim: env.OIDC_GROUPS_CLAIM || 'groups' }; }
+function identityFromClaims(claims, settings) { if (!claims?.sub) throw new Error('IdP did not return a subject claim.'); const groups = claims[settings.groupsClaim], list = Array.isArray(groups) ? groups : typeof groups === 'string' ? [groups] : []; if (!list.includes(settings.allowedGroup)) { const error = new Error('このアカウントには利用権限がありません。'); error.code = 'FORBIDDEN'; throw error; } return { subject: claims.sub, name: claims.name || claims.preferred_username || '', email: claims.email || '' }; }
+export function createOidcAuthenticator({ settings = oidcSettingsFromEnv(), store = createSessionStore(undefined, { adminSubject: settings.adminSubject }), client = oidc } = {}) { let configuration; const config = async () => (configuration ||= client.discovery(new URL(settings.issuer), settings.clientId, { client_secret: settings.clientSecret, redirect_uris: [settings.redirectUri], response_types: ['code'] })); return { store, async login(req, res, next) { try { const flow = store.createFlow(), challenge = await client.calculatePKCECodeChallenge(flow.codeVerifier); res.redirect(client.buildAuthorizationUrl(await config(), { redirect_uri: settings.redirectUri, scope: 'openid profile email', response_type: 'code', state: flow.state, nonce: flow.nonce, code_challenge: challenge, code_challenge_method: 'S256' }).href); } catch (error) { next(error); } }, async callback(req, res, next) { try { const flow = store.takeFlow(req.query.state); if (!flow) return res.status(400).send('ログイン要求が無効または期限切れです。もう一度ログインしてください。'); const callbackUrl = new URL(`${req.protocol}://${req.get('host')}${req.originalUrl}`), tokens = await client.authorizationCodeGrant(await config(), callbackUrl, { pkceCodeVerifier: flow.codeVerifier, expectedState: req.query.state, expectedNonce: flow.nonce }); let claims = tokens.claims(); if ((!claims?.[settings.groupsClaim]) && tokens.access_token) claims = { ...claims, ...await client.fetchUserInfo(await config(), tokens.access_token, claims?.sub) }; const { value } = store.createSession(identityFromClaims(claims, settings)); res.cookie('dmt_session', value, { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: eightHours }); res.redirect('/'); } catch (error) { if (error.code === 'FORBIDDEN') return res.status(403).send(error.message); next(error); } } }; }
+export function createAuthMiddleware(authenticator) { const store = authenticator.store, sessionFor = req => store.getSession(parseCookies(req.headers.cookie).dmt_session), noAuth = res => res.status(401).json({ error: { message: '認証が必要です。', guidance: 'ログインしてからもう一度実行してください。' } }), noRole = (res, message = 'この操作を実行する権限がありません。') => res.status(403).json({ error: { message, guidance: '管理者に必要なロールの割り当てを依頼してください。' } }); return { requireAuth(req, res, next) { const session = sessionFor(req); if (!session) return req.originalUrl.startsWith('/api/') ? noAuth(res) : res.redirect('/auth/login'); req.auth = session; next(); }, requireRole(role) { return (req, res, next) => rank[req.auth.role] >= rank[role] ? next() : noRole(res); }, me(req, res) { const { subject, name, email, role, host, csrfToken, expiresAt } = req.auth; res.json({ subject, name, email, role, host, csrfToken, expiresAt }); }, logout(req, res) { if (req.get('origin') !== `${req.protocol}://${req.get('host')}` || req.get('x-csrf-token') !== req.auth.csrfToken) return noRole(res, '無効なログアウト要求です。'); store.destroySession(parseCookies(req.headers.cookie).dmt_session); res.clearCookie('dmt_session', { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }); res.status(204).end(); }, csrf(req, res, next) { if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next(); if (req.get('origin') !== `${req.protocol}://${req.get('host')}` || req.get('x-csrf-token') !== req.auth.csrfToken) return noRole(res, '無効な操作要求です。画面を更新してもう一度実行してください。'); next(); } }; }
